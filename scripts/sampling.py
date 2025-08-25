@@ -3,6 +3,42 @@ import numpy as np
 import logging
 from scripts import datasets
 
+def get_sampling_fn_inverse_heat_from_blur(config,
+                                 intermediate_sample_indices, delta, device,
+                                 share_noise=False):
+    """ Returns our inverse heat process sampling function. 
+    Arguments: 
+    initial_sample: Pytorch Tensor with the initial draw from the prior p(u_K)
+    intermediate_sample_indices: list of indices to save (e.g., [0,1,2,3...] or [0,2,4,...])
+    delta: Standard deviation of the sampling noise
+    share_noise: Whether to use the same noises for all elements in the batch
+    """
+    K = config.model.K
+    def sampler(model,blur):
+
+        intermediate_samples_out = []
+
+        with torch.no_grad():
+            u = blur.to(config.device).float()
+            if intermediate_sample_indices != None and K in intermediate_sample_indices:
+                intermediate_samples_out.append((u, u))
+            for i in range(K, 0, -1):
+                vec_fwd_steps = torch.ones(
+                    u.shape[0], device=device, dtype=torch.long) * i
+                # Predict less blurry mean
+                u_mean = model(u, vec_fwd_steps) + u
+                # Sampling step
+                if share_noise:
+                    noise = noises[i-1]
+                else:
+                    noise = torch.randn_like(u)
+                u = u_mean + noise*delta
+                # Save trajectory
+                if intermediate_sample_indices != None and i-1 in intermediate_sample_indices:
+                    intermediate_samples_out.append((u, u_mean))
+
+            return u_mean, config.model.K, [u for (u, u_mean) in intermediate_samples_out]
+    return sampler
 
 def get_sampling_fn_inverse_heat(config, initial_sample,
                                  intermediate_sample_indices, delta, device,
@@ -100,7 +136,7 @@ def get_sampling_fn_inverse_heat_interpolate(config, initial_sample,
 
 def get_initial_sample(config, forward_heat_module, delta, batch_size=None):
     """Take a draw from the prior p(u_K)"""
-    trainloader, _ = datasets.get_dataset(config,
+    trainloader = datasets.get_dataset(config,
                                           uniform_dequantization=config.data.uniform_dequantization,
                                           train_batch_size=batch_size)
 

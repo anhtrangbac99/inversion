@@ -57,18 +57,46 @@ def optimization_manager(config):
 def get_label_sampling_function(K):
     return lambda batch_size, device: torch.randint(1, K, (batch_size,), device=device)
 
+def get_inverse_heat_loss_fn(config, train, scales, device, heat_forward_module):
 
-def get_inverse_heat_loss_fn(config, train, scales, device, heat_forward_module,timestep):
+    sigma = config.model.sigma
+    label_sampling_fn = get_label_sampling_function(config.model.K)
+
+    def loss_fn(model, batch):
+        blur,sharp = batch[0],batch[1]
+        model_fn = mutils.get_model_fn(
+            model, train=train)  # get train/eval model
+        fwd_steps = label_sampling_fn(blur.shape[0], blur.device)
+        blurred_batch = heat_forward_module(blur, fwd_steps).float()
+        less_blurred_batch = heat_forward_module(sharp, fwd_steps-1).float()
+        noise = torch.randn_like(blurred_batch) * sigma
+        perturbed_data = noise + blurred_batch
+        # print(perturbed_data.size())
+        # print(fwd_steps.size())
+        diff = model_fn(perturbed_data, fwd_steps)
+        prediction = perturbed_data + diff
+        losses = (less_blurred_batch - prediction)**2
+        losses = torch.sum(losses.reshape(losses.shape[0], -1), dim=-1)
+        loss = torch.mean(losses)
+        return loss, losses, fwd_steps
+
+    return loss_fn
+
+def get_timestep_loss(config,train,device,heat_forward_module):
+    pass
+
+def get_inverse_heat_loss_fn_new(config, train, scales, device, heat_forward_module,timestep):
 
     sigma = config.model.sigma
     label_sampling_fn = timestep
 
     def loss_fn(model, batch):
+        blur,sharp = batch[0],batch[1]
         model_fn = mutils.get_model_fn(
             model, train=train)  # get train/eval model
-        fwd_steps = label_sampling_fn(batch.shape[0], batch.device)
-        blurred_batch = heat_forward_module(batch, fwd_steps).float()
-        less_blurred_batch = heat_forward_module(batch, fwd_steps-1).float()
+        fwd_steps = label_sampling_fn(blur.shape[0], batch.device)
+        blurred_batch = heat_forward_module(blur, fwd_steps).float()
+        less_blurred_batch = heat_forward_module(sharp, fwd_steps-1).float()
         noise = torch.randn_like(blurred_batch) * sigma
         perturbed_data = noise + blurred_batch
         diff = model_fn(perturbed_data, fwd_steps)

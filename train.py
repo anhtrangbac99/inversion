@@ -12,7 +12,8 @@ from scripts import utils
 from absl import app
 from absl import flags
 from ml_collections.config_flags import config_flags
-
+from tqdm import tqdm
+import numpy as np
 FLAGS = flags.FLAGS
 
 config_flags.DEFINE_config_file(
@@ -68,10 +69,10 @@ def train(config, workdir):
     initial_step = int(state['step'])
 
     # Build data iterators
-    trainloader, testloader = datasets.get_dataset(
-        config, uniform_dequantization=config.data.uniform_dequantization)
+
+    trainloader = datasets.get_dataset(config,train_batch_size=config.training.batch_size)
     train_iter = iter(trainloader)
-    eval_iter = iter(testloader)
+    # eval_iter = iter(testloader)
 
     # Build one-step training and evaluation functions
     optimize_fn = losses.optimization_manager(config)
@@ -84,15 +85,14 @@ def train(config, workdir):
     # Get the loss function
     train_step_fn = losses.get_step_fn(train=True, scales=scales, config=config, optimize_fn=optimize_fn,
                                        heat_forward_module=heat_forward_module)
-    eval_step_fn = losses.get_step_fn(train=False, scales=scales, config=config, optimize_fn=optimize_fn,
-                                      heat_forward_module=heat_forward_module)
+    # eval_step_fn = losses.get_step_fn(train=False, scales=scales, config=config, optimize_fn=optimize_fn,
+    #                                   heat_forward_module=heat_forward_module)
 
     # Building sampling functions
     delta = config.model.sigma*1.25
-    initial_sample, _ = sampling.get_initial_sample(
-        config, heat_forward_module, delta)
-    sampling_fn = sampling.get_sampling_fn_inverse_heat(config,
-                                                        initial_sample, intermediate_sample_indices=list(
+
+    sampling_fn = sampling.get_sampling_fn_inverse_heat_from_blur(config,
+                                                        intermediate_sample_indices=list(
                                                             range(config.model.K+1)),
                                                         delta=config.model.sigma*1.25, device=config.device)
 
@@ -102,62 +102,72 @@ def train(config, workdir):
 
     # For analyzing the mean values of losses over many batches, for each scale separately
     pooled_losses = torch.zeros(len(scales))
+    iter_num = 0
+    with tqdm(range(len(trainloader))) as pbar:
 
-    for step in range(initial_step, num_train_steps + 1):
-        # Train step
-        try:
-            batch = next(train_iter)[0].to(config.device).float()
-        except StopIteration:  # Start new epoch if run out of data
-            train_iter = iter(trainloader)
-            batch = next(train_iter)[0].to(config.device).float()
-        loss, losses_batch, fwd_steps_batch = train_step_fn(state, batch)
+        for step in range(initial_step, num_train_steps + 1):
+            iter_num +=1
+            # Train step
+            try:
+                batch = next(train_iter)
+                blur,sharp = batch[0].to(config.device).float(),batch[1].to(config.device).float()
+            except StopIteration:  # Start new epoch if run out of data
+                train_iter = iter(trainloader)
+                batch = next(train_iter)
+                blur,sharp = batch[0].to(config.device).float(),batch[1].to(config.device).float()
+            loss, losses_batch, fwd_steps_batch = train_step_fn(state, [blur,sharp])
 
-        writer.add_scalar("training_loss", loss.item(), step)
 
-        # Save a temporary checkpoint to resume training if training is stopped
-        if step != 0 and step % config.training.snapshot_freq_for_preemption == 0:
-            logging.info("Saving temporary checkpoint")
-            utils.save_checkpoint(checkpoint_meta_dir, state)
+            if step%20==0:
+                # print(f"Iter [{iter_num}/{num_train_steps + 1}], Loss: {loss.item():.4f}")
+                logging.info("Iter [%d/%d],Loss:{%4f}." % (iter_num,num_train_steps + 1,loss.item()))
+            writer.add_scalar("training_loss", loss.item(), step)
 
-        # Report the loss on an evaluation dataset periodically
-        if step % config.training.eval_freq == 0:
-            logging.info("Starting evaluation")
-            # Use 25 batches for test-set evaluation, arbitrary choice
-            N_evals = 25
-            for i in range(N_evals):
-                try:
-                    eval_batch = next(eval_iter)[0].to(config.device).float()
-                except StopIteration:  # Start new epoch
-                    eval_iter = iter(testloader)
-                    eval_batch = next(eval_iter)[0].to(config.device).float()
-                eval_loss, losses_batch, fwd_steps_batch = eval_step_fn(state, eval_batch)
-                eval_loss = eval_loss.detach()
-            logging.info("step: %d, eval_loss: %.5e" % (step, eval_loss.item()))
+            # Save a temporary checkpoint to resume training if training is stopped
+            if step != 0 and step % config.training.snapshot_freq_for_preemption == 0:
+                logging.info("Saving temporary checkpoint")
+                utils.save_checkpoint(checkpoint_meta_dir, state)
 
-        # Save a checkpoint periodically
-        if step != 0 and step % config.training.snapshot_freq == 0 or step == num_train_steps:
-            logging.info("Saving a checkpoint")
-            # Save the checkpoint.
-            save_step = step // config.training.snapshot_freq
-            utils.save_checkpoint(os.path.join(
-                checkpoint_dir, 'checkpoint_{}.pth'.format(save_step)), state)
+            # Report the loss on an evaluation dataset periodically
+            # if step % config.training.eval_freq == 0:
+            #     logging.info("Starting evaluation")
+            #     # Use 25 batches for test-set evaluation, arbitrary choice
+            #     N_evals = 25
+            #     for i in range(N_evals):
+            #         try:
+            #             eval_batch = next(eval_iter)[0].to(config.device).float()
+            #         except StopIteration:  # Start new epoch
+            #             eval_iter = iter(testloader)
+            #             eval_batch = next(eval_iter)[0].to(config.device).float()
+            #         eval_loss, losses_batch, fwd_steps_batch = eval_step_fn(state, eval_batch)
+            #         eval_loss = eval_loss.detach()
+            #     logging.info("step: %d, eval_loss: %.5e" % (step, eval_loss.item()))
 
-        # Generate samples periodically
-        if step != 0 and step % config.training.sampling_freq == 0 or step == num_train_steps:
-            logging.info("Sampling...")
-            ema.store(model.parameters())
-            ema.copy_to(model.parameters())
-            sample, n, intermediate_samples = sampling_fn(model_evaluation_fn)
-            ema.restore(model.parameters())
-            this_sample_dir = os.path.join(sample_dir, "iter_{}".format(step))
-            Path(this_sample_dir).mkdir(parents=True, exist_ok=True)
-            utils.save_tensor(this_sample_dir, sample, "final.np")
-            utils.save_png(this_sample_dir, sample, "final.png")
-            if initial_sample != None:
-                utils.save_png(this_sample_dir, initial_sample, "init.png")
-            utils.save_gif(this_sample_dir, intermediate_samples)
-            utils.save_video(this_sample_dir, intermediate_samples)
+            # Save a checkpoint periodically
+            if step != 0 and step % config.training.snapshot_freq == 0 or step == num_train_steps:
+                logging.info("Saving a checkpoint")
+                # Save the checkpoint.
+                save_step = step // config.training.snapshot_freq
+                utils.save_checkpoint(os.path.join(
+                    checkpoint_dir, 'checkpoint_{}.pth'.format(save_step)), state)
 
+            # Generate samples periodically
+            if step % config.training.sampling_freq == 0 or step == num_train_steps: #step != 0 and 
+
+                # blur = batch[0]
+                logging.info("Sampling...")
+                ema.store(model.parameters())
+                ema.copy_to(model.parameters())
+                sample, n, intermediate_samples = sampling_fn(model_evaluation_fn,blur)
+                ema.restore(model.parameters())
+                this_sample_dir = os.path.join(sample_dir, "iter_{}".format(step))
+                Path(this_sample_dir).mkdir(parents=True, exist_ok=True)
+                utils.save_tensor(this_sample_dir, sample, "final.np")
+                utils.save_png(this_sample_dir, sample, "final.png")
+                # if initial_sample != None:
+                utils.save_png(this_sample_dir, blur, "init.png")
+                utils.save_gif(this_sample_dir, intermediate_samples)
+                utils.save_video(this_sample_dir, intermediate_samples)
 
 if __name__ == "__main__":
     app.run(main)
