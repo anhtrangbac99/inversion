@@ -22,8 +22,8 @@ config_flags.DEFINE_config_file(
     "config", None, "Training configuration.", lock_config=True)
 flags.DEFINE_string("workdir", None, "Work directory.")
 flags.mark_flags_as_required(["workdir", "config"])
+#flags.DEFINE_string("initialization", "prior", "How to initialize sampling")
 flags.DEFINE_boolean("train_sharp", False, "Which loss will be used")
-
 flags.DEFINE_boolean("from_start", False, "Train from step num 0")
 
 def main(argv):
@@ -53,8 +53,7 @@ def train(config, workdir, train_sharp=False,from_start=True):
 
     # Initialize model
     device_ids = list(range(torch.cuda.device_count()))
-
-    model = mutils.create_model(config,device_ids)
+    model = mutils.create_model_timestep(config,device_ids)
     optimizer = losses.get_optimizer(config, model.parameters())
     ema = ExponentialMovingAverage(
         model.parameters(), decay=config.model.ema_rate)
@@ -69,6 +68,7 @@ def train(config, workdir, train_sharp=False,from_start=True):
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
     Path(os.path.dirname(checkpoint_meta_dir)).mkdir(
         parents=True, exist_ok=True)
+
     postprocess = transforms.Compose([
                 transforms.Normalize((-0.5/0.5, -0.5/0.5, -0.5/0.5),(1/0.5, 1/0.5, 1/0.5))
         ])
@@ -91,15 +91,16 @@ def train(config, workdir, train_sharp=False,from_start=True):
     # Get the forward process definition
     scales = config.model.blur_schedule
     heat_forward_module = mutils.create_forward_process_from_sigmas(
-        config, scales, config.device)
+        config, scales, config.device,timestep=True)
 
     # Get the loss function
     if not train_sharp:
-        train_step_fn = losses.get_step_fn(train=True, scales=scales, config=config, optimize_fn=optimize_fn,
+        train_step_fn = losses.get_step_fn_timestep(train=True, scales=scales, config=config, optimize_fn=optimize_fn,
                                        heat_forward_module=heat_forward_module)
     else:
-        train_step_fn = losses.get_step_fn_predict_sharp(train=True, scales=scales, config=config, optimize_fn=optimize_fn,
+        train_step_fn = losses.get_step_fn_timestep_predict_sharp(train=True, scales=scales, config=config, optimize_fn=optimize_fn,
                                        heat_forward_module=heat_forward_module)
+
     # eval_step_fn = losses.get_step_fn(train=False, scales=scales, config=config, optimize_fn=optimize_fn,
     #                                   heat_forward_module=heat_forward_module)
 
@@ -115,7 +116,8 @@ def train(config, workdir, train_sharp=False,from_start=True):
         sampling_fn = sampling.get_sampling_fn_inverse_heat_from_blur_with_train_sharp(config,
                                                         intermediate_sample_indices=list(
                                                             range(config.model.K+1)),
-                                                        delta=config.model.sigma*1.25, device=config.device,heat_forward_module=heat_forward_module,baseline=True)
+                                                        delta=config.model.sigma*1.25, device=config.device,heat_forward_module=heat_forward_module)
+
 
     num_train_steps = config.training.n_iters
     logging.info("Starting training loop at step %d." % (initial_step,))
@@ -136,12 +138,13 @@ def train(config, workdir, train_sharp=False,from_start=True):
                 train_iter = iter(trainloader)
                 batch = next(train_iter)
                 blur,sharp = batch[0].to(config.device).float(),batch[1].to(config.device).float()
-            loss, losses_batch, fwd_steps_batch = train_step_fn(state, [blur,sharp])
-
+            # if iter_num == 19:
+            #     exit()
+            loss,_,lost_timestep, lost_fn = train_step_fn(state, [blur,sharp])
 
             if step%20==0:
                 # print(f"Iter [{iter_num}/{num_train_steps + 1}], Loss: {loss.item():.4f}")
-                logging.info("Iter [%d/%d],Loss:{%4f}." % (iter_num,num_train_steps + 1,loss.item()))
+                logging.info("Iter [%d/%d],Loss:{%4f},LossTimeStep:{%4f},LossFN:{%4f}." % (iter_num,num_train_steps + 1,loss,lost_timestep.item(),lost_fn.item()))
             writer.add_scalar("training_loss", loss.item(), step)
 
             # Save a temporary checkpoint to resume training if training is stopped
@@ -176,7 +179,7 @@ def train(config, workdir, train_sharp=False,from_start=True):
             try:
                 if step % config.training.sampling_freq == 0 or step == num_train_steps: #step != 0 and 
 
-                    # blur = batch[0]
+                # blur = batch[0]
                     logging.info("Sampling...")
                     ema.store(model.parameters())
                     ema.copy_to(model.parameters())

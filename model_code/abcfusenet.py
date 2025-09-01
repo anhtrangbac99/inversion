@@ -303,7 +303,7 @@ class ABSFusenet(nn.Module):
         return output
 
 if __name__ == "__main__":
-    img = torch.rand((4,3,256,256))
+    img = torch.rand((4,3,64,64))
     model = ABSFusenet()
     y = model(img)
     print(model.parameters())

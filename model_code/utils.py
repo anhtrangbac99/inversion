@@ -5,7 +5,22 @@ import logging
 import numpy as np
 from model_code.unet import UNetModel
 from model_code import torch_dct
+from model_code.abcfusenet import ABSFusenet
 
+class DCTBlur_timestep(nn.Module):
+    def __init__(self, image_size, device):
+        super(DCTBlur_timestep, self).__init__()
+        freqs = np.pi*torch.linspace(0, image_size-1,
+                                     image_size).to(device)/image_size
+        self.frequencies_squared = freqs[:, None]**2 + freqs[None, :]**2
+
+    def forward(self, x, fwd_steps):
+        t = fwd_steps.unsqueeze(-1).unsqueeze(-1)
+    
+        self.frequencies_squared * t
+        dct_coefs = torch_dct.dct_2d(x, norm='ortho')
+        dct_coefs = dct_coefs * torch.exp(- self.frequencies_squared * t)
+        return torch_dct.idct_2d(dct_coefs, norm='ortho')
 
 class DCTBlur(nn.Module):
 
@@ -27,7 +42,10 @@ class DCTBlur(nn.Module):
         return torch_dct.idct_2d(dct_coefs, norm='ortho')
 
 
-def create_forward_process_from_sigmas(config, sigmas, device):
+def create_forward_process_from_sigmas(config, sigmas, device,timestep = False):
+    if timestep:
+        forward_process_module = DCTBlur_timestep(config.data.image_size, device)
+        return forward_process_module
     forward_process_module = DCTBlur(sigmas, config.data.image_size, device)
     return forward_process_module
 
@@ -169,6 +187,13 @@ def create_model(config, device_ids=None):
     model = torch.nn.DataParallel(model, device_ids=device_ids)
     return model
 
+def create_model_timestep(config,device_ids=None):
+    from model_code.timestep_net import TSNet
+
+    model = TSNet(config)
+    model = model.to(config.device)
+    model = torch.nn.DataParallel(model, device_ids=device_ids)
+    return model 
 
 def get_model_fn(model, train=False):
     """A wrapper for using the model in eval or train mode"""

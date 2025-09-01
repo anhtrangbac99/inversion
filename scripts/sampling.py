@@ -40,6 +40,51 @@ def get_sampling_fn_inverse_heat_from_blur(config,
             return u_mean, config.model.K, [u for (u, u_mean) in intermediate_samples_out]
     return sampler
 
+def get_sampling_fn_inverse_heat_from_blur_with_train_sharp(config,
+                                 intermediate_sample_indices, delta, device,heat_forward_module,
+                                 share_noise=False,baseline=False):
+    """ Returns our inverse heat process sampling function. 
+    Arguments: 
+    initial_sample: Pytorch Tensor with the initial draw from the prior p(u_K)
+    intermediate_sample_indices: list of indices to save (e.g., [0,1,2,3...] or [0,2,4,...])
+    delta: Standard deviation of the sampling noise
+    share_noise: Whether to use the same noises for all elements in the batch
+    """
+    K = config.model.K
+    def sampler(model,blur):
+
+        intermediate_samples_out = []
+
+        with torch.no_grad():
+            u = blur.to(config.device).float()
+            if intermediate_sample_indices != None and K in intermediate_sample_indices:
+                intermediate_samples_out.append((u, u))
+            for i in range(K, 0, -1):
+                vec_fwd_steps = torch.ones(
+                    u.shape[0], device=device, dtype=torch.long) * i
+                # Predict the sharp image at timestep i
+
+                if baseline:
+                    vec_fwd_steps=vec_fwd_steps.unsqueeze(-1)
+                u_clean = model(u,vec_fwd_steps ) 
+
+                # Predict less blur image at timestep i-1
+                vec_fwd_steps_m1 = torch.ones(
+                    u.shape[0], device=device, dtype=torch.long) * (i-1)
+                u_mean = heat_forward_module(u_clean,vec_fwd_steps_m1.unsqueeze(-1)).float()
+                # Sampling step
+                if share_noise:
+                    noise = noises[i-1]
+                else:
+                    noise = torch.randn_like(u)
+                u = u_mean + noise*delta
+                # Save trajectory
+                if intermediate_sample_indices != None and i-1 in intermediate_sample_indices:
+                    intermediate_samples_out.append((u, u_mean))
+
+            return u_clean, config.model.K, [u_mean for (u, u_mean) in intermediate_samples_out]
+    return sampler
+
 def get_sampling_fn_inverse_heat(config, initial_sample,
                                  intermediate_sample_indices, delta, device,
                                  share_noise=False):
@@ -67,7 +112,9 @@ def get_sampling_fn_inverse_heat(config, initial_sample,
                 vec_fwd_steps = torch.ones(
                     initial_sample.shape[0], device=device, dtype=torch.long) * i
                 # Predict less blurry mean
+                
                 u_mean = model(u, vec_fwd_steps) + u
+
                 # Sampling step
                 if share_noise:
                     noise = noises[i-1]
